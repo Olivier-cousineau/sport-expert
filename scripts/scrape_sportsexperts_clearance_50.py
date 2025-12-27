@@ -6,7 +6,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -70,6 +70,38 @@ COOKIE_SELECTORS = [
     "button:has-text('I Accept')",
     "button:has-text('Allow all')",
 ]
+
+PLP_SELECTORS = [
+    "[data-product-id]",
+    "[data-testid='product-card']",
+    ".product-card",
+    ".product-grid",
+    ".product-list",
+    "ul.products",
+]
+
+ANTI_BOT_HTML_KEYWORDS = [
+    "access denied",
+    "captcha",
+    "pardon",
+    "unusual traffic",
+    "robot",
+    "verify",
+    "blocked",
+]
+
+ANTI_BOT_TITLE_KEYWORDS = [
+    "denied",
+    "attention",
+    "security",
+]
+
+STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
+STEALTH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+STEALTH_HEADERS = {"Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8"}
 
 
 @dataclass
@@ -205,6 +237,30 @@ def accept_cookies(page) -> None:
             continue
 
 
+def save_debug_artifacts(page, debug_dir: str, prefix: str) -> None:
+    html_path = os.path.join(debug_dir, f"{prefix}.html")
+    png_path = os.path.join(debug_dir, f"{prefix}.png")
+    try:
+        page.screenshot(path=png_path, full_page=True)
+    except Exception as exc:
+        print(f"Erreur screenshot {prefix}: {exc}")
+    try:
+        with open(html_path, "w", encoding="utf-8") as handle:
+            handle.write(page.content())
+    except Exception as exc:
+        print(f"Erreur HTML {prefix}: {exc}")
+
+
+def is_antibot_page(html: str, title: str) -> bool:
+    html_lower = html.lower()
+    title_lower = title.lower()
+    if any(keyword in html_lower for keyword in ANTI_BOT_HTML_KEYWORDS):
+        return True
+    if any(keyword in title_lower for keyword in ANTI_BOT_TITLE_KEYWORDS):
+        return True
+    return False
+
+
 def find_card_elements(page) -> List:
     elements = []
     seen = set()
@@ -249,7 +305,7 @@ def click_load_more(page) -> bool:
     return False
 
 
-def load_all_products(page, max_cycles: int, stable_cycles: int) -> None:
+def load_all_products(page, max_cycles: int, stable_cycles: int, min_cycles: int) -> None:
     stability = 0
     last_count = 0
     for cycle in range(max_cycles):
@@ -264,7 +320,7 @@ def load_all_products(page, max_cycles: int, stable_cycles: int) -> None:
         else:
             stability = 0
         last_count = current_count
-        if stability >= stable_cycles:
+        if stability >= stable_cycles and (cycle + 1) >= min_cycles:
             break
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
@@ -313,6 +369,12 @@ def parse_args() -> argparse.Namespace:
         help="Stop when product count is stable for this many cycles.",
     )
     parser.add_argument(
+        "--min-cycles",
+        type=int,
+        default=5,
+        help="Minimum scroll/load cycles before allowing stability stop.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode (headed + save screenshot/html).",
@@ -325,10 +387,88 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_product_from_payload(payload: dict, page_url: str) -> Optional[Product]:
+    title = payload.get("title") or payload.get("name")
+    if title:
+        title = clean_text(str(title))
+
+    url = payload.get("url") or payload.get("productUrl") or payload.get("link")
+    if isinstance(url, dict):
+        url = url.get("href")
+    if url:
+        url = urljoin(page_url, str(url))
+
+    image = payload.get("image") or payload.get("imageUrl") or payload.get("image_url")
+    if isinstance(image, dict):
+        image = image.get("url") or image.get("src")
+    if image:
+        image = urljoin(page_url, str(image))
+
+    price_original = None
+    price_sale = None
+
+    direct_price = payload.get("price")
+    if isinstance(direct_price, dict):
+        price_values = parse_price_values(json.dumps(direct_price))
+    else:
+        price_values = parse_price_values(str(direct_price)) if direct_price is not None else []
+
+    for key in ["salePrice", "sale_price", "currentPrice", "current_price", "sale"]:
+        if key in payload:
+            price_values.extend(parse_price_values(str(payload.get(key))))
+
+    for key in ["originalPrice", "regularPrice", "regular_price", "listPrice", "original"]:
+        if key in payload:
+            price_values.extend(parse_price_values(str(payload.get(key))))
+
+    if "prices" in payload and isinstance(payload["prices"], list):
+        for entry in payload["prices"]:
+            if isinstance(entry, dict):
+                price_values.extend(parse_price_values(json.dumps(entry)))
+
+    price_original, price_sale = derive_prices(price_values)
+    discount_percent = compute_discount(price_original, price_sale)
+
+    if not title or price_sale is None:
+        return None
+
+    return Product(
+        title=title,
+        url=url,
+        image=image,
+        price_original=price_original,
+        price_sale=price_sale,
+        discount_percent=discount_percent,
+    )
+
+
+def extract_products_from_json(payload: Any, page_url: str) -> List[Product]:
+    products: List[Product] = []
+    seen = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            product = parse_product_from_payload(node, page_url)
+            if product:
+                key = (product.url, product.title, product.price_sale)
+                if key not in seen:
+                    seen.add(key)
+                    products.append(product)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return products
+
+
 def main() -> None:
     args = parse_args()
     debug_env = os.getenv("DEBUG", "0")
     debug_mode = args.debug or debug_env == "1"
+    start_time = time.time()
 
     output_dir = "outputs"
     debug_dir = os.path.join(output_dir, "debug")
@@ -336,33 +476,90 @@ def main() -> None:
     ensure_output_dir(debug_dir)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=not debug_mode)
-        context = browser.new_context(locale="fr-CA")
+        browser = playwright.chromium.launch(headless=not debug_mode, args=STEALTH_ARGS)
+        context = browser.new_context(
+            locale="fr-CA",
+            user_agent=STEALTH_USER_AGENT,
+            extra_http_headers=STEALTH_HEADERS,
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
         page = context.new_page()
-        page.goto(args.url, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
+        captured_products: List[Product] = []
+        captured_urls: List[str] = []
+        json_response_count = 0
+
+        def handle_response(response) -> None:
+            nonlocal json_response_count
+            content_type = response.headers.get("content-type", "").lower()
+            url = response.url
+            if "application/json" not in content_type:
+                return
+            if not any(token in url.lower() for token in ["search", "products", "plp", "listing", "graphql"]):
+                return
+            json_response_count += 1
+            if url not in captured_urls:
+                captured_urls.append(url)
+            try:
+                payload = response.json()
+            except Exception:
+                return
+            extracted = extract_products_from_json(payload, page.url)
+            if extracted:
+                captured_products.extend(extracted)
+
+        page.on("response", handle_response)
+
+        page.goto(args.url, wait_until="networkidle", timeout=60000)
+        page.wait_for_load_state("networkidle", timeout=30000)
+        page.wait_for_timeout(2000)
         accept_cookies(page)
+        save_debug_artifacts(page, debug_dir, "se_after_goto")
 
-        load_all_products(page, max_cycles=args.max_cycles, stable_cycles=args.stable_cycles)
+        try:
+            page.wait_for_selector(",".join(PLP_SELECTORS), timeout=60000)
+            dom_ready = True
+        except PlaywrightTimeoutError:
+            dom_ready = False
+            print("MODE 1 échoué (DOM non détecté) -> fallback MODE 2")
 
-        if debug_mode:
-            html_path = os.path.join(debug_dir, "se_after_load.html")
-            png_path = os.path.join(debug_dir, "se_after_load.png")
-            page.screenshot(path=png_path, full_page=True)
-            with open(html_path, "w", encoding="utf-8") as handle:
-                handle.write(page.content())
+        load_all_products(
+            page,
+            max_cycles=args.max_cycles,
+            stable_cycles=args.stable_cycles,
+            min_cycles=args.min_cycles,
+        )
+        save_debug_artifacts(page, debug_dir, "se_after_load")
 
-        cards = find_card_elements(page)
-        print(f"Total candidates détectés: {len(cards)}")
+        html_content = page.content()
+        page_title = page.title()
+        if is_antibot_page(html_content, page_title):
+            print("ANTI-BOT SUSPECTÉ - artefacts conservés pour diagnostic.")
 
         items_by_url = {}
-        for card in cards:
-            product = extract_product_from_card(card, page.url)
-            if product.url is None:
-                continue
-            if product.url in items_by_url:
-                continue
-            items_by_url[product.url] = product
+        if dom_ready:
+            cards = find_card_elements(page)
+            print(f"Total candidates détectés (DOM): {len(cards)}")
+            for card in cards:
+                product = extract_product_from_card(card, page.url)
+                if product.url is None:
+                    continue
+                if product.url in items_by_url:
+                    continue
+                items_by_url[product.url] = product
+        else:
+            print("Extraction DOM ignorée (MODE 2 requis).")
+
+        if not items_by_url and captured_products:
+            for product in captured_products:
+                if product.url:
+                    key = product.url
+                else:
+                    key = f"{product.title}-{product.price_sale}"
+                if key in items_by_url:
+                    continue
+                items_by_url[key] = product
 
         products = list(items_by_url.values())
         filtered = [
@@ -378,6 +575,7 @@ def main() -> None:
             )
         )
 
+        print(f"Total candidates détectés: {len(products)}")
         print(f"Total filtrés 50%+: {len(filtered)}")
 
         csv_path = os.path.join(output_dir, "sportsexperts_liquidation_50plus.csv")
@@ -387,6 +585,12 @@ def main() -> None:
 
         print(f"CSV: {csv_path}")
         print(f"JSON: {json_path}")
+        end_time = time.time()
+        print(f"Durée totale: {end_time - start_time:.2f}s")
+        print(f"Réponses JSON capturées: {json_response_count}")
+        print("Top 5 URLs XHR détectées:")
+        for url in captured_urls[:5]:
+            print(f"- {url}")
 
         context.close()
         browser.close()
