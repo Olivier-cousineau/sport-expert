@@ -1,0 +1,54 @@
+name: Run scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      max-cycles:
+        description: "Nombre maximal de cycles de scraping"
+        required: false
+        default: "40"
+      stable-cycles:
+        description: "Nombre de cycles stables avant arrêt"
+        required: false
+        default: "6"
+      debug:
+        description: "Activer le mode debug"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install chromium
+
+      - name: Run scraper
+        env:
+          DEBUG: ${{ inputs.debug && '1' || '' }}
+        run: |
+          python scripts/scrape_sportsexperts_clearance_50.py \
+            --max-cycles "${{ inputs.max-cycles }}" \
+            --stable-cycles "${{ inputs.stable-cycles }}"
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-outputs
+          path: |
+            outputs/**
+          if-no-files-found: ignore
