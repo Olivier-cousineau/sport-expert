@@ -1,0 +1,33 @@
+name: Normalize online data
+
+on:
+  push:
+    paths:
+      - 'sportsexperts-2025-12-27 (2).json'
+      - 'scripts/normalize_online.js'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  normalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Normalize data
+        run: node scripts/normalize_online.js
+
+      - name: Commit normalized data
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore: regenerate normalized online data'
+          file_pattern: data/online.normalized.json
