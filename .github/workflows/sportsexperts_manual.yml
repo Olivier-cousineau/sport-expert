@@ -1,0 +1,67 @@
+name: SportExperts Liquidation (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL à scraper"
+        required: true
+        default: "https://www.sportsexperts.ca/fr-CA/rabais/liquidation"
+      max_pages:
+        description: "0 = no limit"
+        required: true
+        default: "0"
+      headless:
+        description: "true/false"
+        required: true
+        default: "true"
+      debug_dom:
+        description: "true/false"
+        required: true
+        default: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          SCRAPE_URL: ${{ inputs.url }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          HEADLESS: ${{ inputs.headless }}
+          DEBUG_DOM: ${{ inputs.debug_dom }}
+        run: |
+          python scripts/scrape_sportsexperts.py \
+            --url "$SCRAPE_URL" \
+            --max-pages "$MAX_PAGES" \
+            --headless "$HEADLESS" \
+            --debug-dom "$DEBUG_DOM" \
+            --save-debug true
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sportsexperts-debug
+          path: outputs/debug/**
+          if-no-files-found: ignore

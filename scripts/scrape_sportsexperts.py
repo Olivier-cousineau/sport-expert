@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -358,6 +359,15 @@ def save_debug_artifacts(page, debug_dir: str, public_dir: str, prefix: str) -> 
         print(f"Erreur HTML {prefix}: {exc}")
 
 
+def save_debug(page, debug_dir: Path, prefix: str = "debug") -> None:
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    html_path = debug_dir / f"{prefix}.html"
+    png_path = debug_dir / f"{prefix}.png"
+    page.screenshot(path=str(png_path), full_page=True)
+    html_path.write_text(page.content(), encoding="utf-8")
+    print(f"[debug] saved: {html_path} {png_path}")
+
+
 def get_page_title(page) -> str:
     try:
         return page.title()
@@ -476,49 +486,117 @@ def log_no_grid_details(page) -> None:
 
 
 def is_blocked_page(page) -> bool:
-    title = get_page_title(page)
+    """
+    Détection stricte: on déclare bloqué seulement si on voit des indices explicites
+    (Cloudflare / captcha / access denied). Ne pas confondre avec "selector introuvable".
+    """
     try:
-        html = page.content()
+        title = (page.title() or "").lower()
     except Exception:
-        html = ""
-    if is_antibot_page(html, title):
+        title = ""
+
+    blocked_title_kw = [
+        "access denied",
+        "attention required",
+        "just a moment",
+        "verify you are human",
+        "captcha",
+        "cloudflare",
+        "forbidden",
+        "denied",
+    ]
+    if any(keyword in title for keyword in blocked_title_kw):
         return True
-    html_lower = html.lower()
-    if "cloudflare" in html_lower or "cf-browser-verification" in html_lower:
-        return True
-    for selector in CLOUDFLARE_SELECTORS:
+
+    blocked_selectors = [
+        "#cf-wrapper",
+        "div[class*='cf-']",
+        "iframe[src*='captcha']",
+        "input[name='cf-turnstile-response']",
+        "[data-sitekey]",
+        "text=/verify you are human/i",
+        "text=/access denied/i",
+        "text=/attention required/i",
+        "text=/captcha/i",
+    ]
+    for selector in blocked_selectors:
         try:
-            if page.locator(selector).count() > 0:
+            if page.locator(selector).first.count() > 0:
                 return True
         except Exception:
             continue
+
+    try:
+        body = (page.locator("body").inner_text(timeout=3000) or "").lower()
+    except Exception:
+        body = ""
+    blocked_text_kw = [
+        "access denied",
+        "attention required",
+        "verify you are human",
+        "captcha",
+        "cloudflare",
+        "temporarily blocked",
+        "forbidden",
+        "request blocked",
+    ]
+    if any(keyword in body for keyword in blocked_text_kw):
+        return True
+
     return False
 
 
-def wait_for_grid(page, debug_dom: bool, debug_dir: str) -> str:
-    last_error: Optional[Exception] = None
-    page.wait_for_selector("body", timeout=20000)
-    if debug_dom:
-        log_dom_debug(page)
-    for _ in range(2):
-        page.mouse.wheel(0, 1200)
-        page.wait_for_timeout(1000)
-    for selector in GRID_SELECTORS:
+def wait_for_grid(page, debug_dom: bool, debug_dir: Path) -> str:
+    page.wait_for_load_state("domcontentloaded", timeout=60000)
+    page.wait_for_timeout(1000)
+
+    if is_blocked_page(page):
+        if debug_dom:
+            save_debug(page, debug_dir, prefix="blocked")
+        raise RuntimeError("Page semble bloquée (Cloudflare / Captcha / Access Denied).")
+
+    candidate_selectors = [
+        "a[href*='/p/']",
+        "[data-testid*='product']",
+        "[data-test*='product']",
+        ".product-tile, .productTile, .product-card, .productCard",
+        "[itemtype*='Product']",
+        "li:has(a[href*='/p/'])",
+    ]
+
+    last_counts: List[Tuple[str, int]] = []
+    for selector in candidate_selectors:
         try:
-            page.wait_for_selector(selector, timeout=25000)
-            count = page.locator(selector).count()
+            locator = page.locator(selector)
+            locator.first.wait_for(state="visible", timeout=20000)
+            count = locator.count()
+            last_counts.append((selector, count))
             if count > 0:
                 print(f"[grid] Found tile selector: {selector} (count={count})")
                 return selector
-        except Exception as exc:
-            last_error = exc
-    if is_blocked_page(page):
-        log_blocking_details(page)
-        write_failure_artifacts(page, debug_dir, None)
-        raise RuntimeError("Page semble bloquée (Cloudflare / Captcha / Access Denied).")
-    log_no_grid_details(page)
-    write_failure_artifacts(page, debug_dir, None)
-    raise last_error if last_error else RuntimeError("Grid introuvable (aucun sélecteur ne matche).")
+        except Exception:
+            last_counts.append((selector, 0))
+            continue
+
+    if debug_dom:
+        save_debug(page, debug_dir, prefix="no_grid")
+        try:
+            main_txt = page.locator("main").inner_text(timeout=3000)[:1500]
+        except Exception:
+            main_txt = ""
+        print("[debug_dom] Aucun selector produit trouvé.")
+        print("[debug_dom] URL:", page.url)
+        try:
+            print("[debug_dom] Title:", page.title())
+        except Exception:
+            pass
+        print("[debug_dom] main excerpt:", main_txt)
+        print("[debug_dom] counts:", last_counts)
+
+    raise RuntimeError(
+        "Grille produits introuvable (pas un blocage). "
+        f"selectors_testés={last_counts}"
+    )
 
 
 def count_tiles(page, selector: str) -> int:
@@ -585,7 +663,7 @@ def load_all_products(page, max_pages: int, tile_selector: str) -> LoadMetrics:
 def parse_args() -> argparse.Namespace:
     default_headless = parse_bool(os.getenv("HEADLESS", "true"))
     default_save_debug = parse_bool(os.getenv("SAVE_DEBUG", "true"))
-    default_debug_dom = parse_bool(os.getenv("DEBUG_DOM", "false"))
+    default_debug_dom = parse_bool(os.getenv("DEBUG_DOM", "true"))
     default_max_pages = int(os.getenv("MAX_PAGES", "0") or 0)
     parser = argparse.ArgumentParser(
         description="Scrape Sports Experts clearance products.",
@@ -775,7 +853,7 @@ def main() -> None:
     start_time = time.time()
 
     public_dir = os.path.join("public", "sportsexperts")
-    debug_dir = os.path.join("outputs", "debug")
+    debug_dir = Path("outputs") / "debug"
     ensure_output_dir(public_dir)
     if args.save_debug:
         ensure_output_dir(debug_dir)
@@ -840,12 +918,12 @@ def main() -> None:
             tile_sel = wait_for_grid(page, args.debug_dom, debug_dir)
 
             if args.save_debug:
-                save_debug_artifacts(page, debug_dir, public_dir, "debug")
+                save_debug_artifacts(page, str(debug_dir), public_dir, "debug")
 
             metrics = load_all_products(page, args.max_pages, tile_sel)
 
             if args.save_debug:
-                save_debug_artifacts(page, debug_dir, public_dir, "debug_after_load")
+                save_debug_artifacts(page, str(debug_dir), public_dir, "debug_after_load")
 
             html_content = page.content()
             page_title = get_page_title(page)
@@ -891,7 +969,7 @@ def main() -> None:
                     print(f"- {url}")
         except Exception as exc:
             print(f"Erreur globale: {exc}")
-            write_failure_artifacts(page, debug_dir, last_response_headers)
+            write_failure_artifacts(page, str(debug_dir), last_response_headers)
             raise
         finally:
             context.close()
