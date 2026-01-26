@@ -1,0 +1,51 @@
+name: SportExperts Manual Scrape
+
+on:
+  workflow_dispatch:
+    inputs:
+      headless:
+        description: "Run headless?"
+        required: true
+        default: "true"
+      max_pages:
+        description: "Max pages (0 = no limit)"
+        required: true
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          HEADLESS: ${{ inputs.headless }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          SAVE_DEBUG: "true"
+        run: |
+          python scripts/scrape_sportsexperts.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sportsexperts-debug
+          path: |
+            outputs/debug/**
+          if-no-files-found: ignore
