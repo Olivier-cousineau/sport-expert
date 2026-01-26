@@ -5,6 +5,7 @@ import os
 import re
 import time
 from pathlib import Path
+import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -129,9 +130,9 @@ CLOUDFLARE_SELECTORS = [
 STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
 STEALTH_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 )
-STEALTH_HEADERS = {"Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8"}
+STEALTH_HEADERS = {"Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8,en;q=0.7"}
 
 
 @dataclass
@@ -546,6 +547,107 @@ def is_blocked_page(page) -> bool:
     return False
 
 
+def wait_for_hydration(page, timeout_ms: int = 45000) -> None:
+    page.wait_for_function(
+        """() => {
+            const text = document.body?.innerText || "";
+            const hasPlaceholder = text.includes("{{TotalCount}}");
+            const hasProducts = /\\b\\d+[\\s\\u00A0]*produits\\b/i.test(text);
+            return !hasPlaceholder && hasProducts;
+        }""",
+        timeout=timeout_ms,
+    )
+
+
+def is_product_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("hits"), list) and payload["hits"]:
+        return True
+    results = payload.get("results")
+    if isinstance(results, list):
+        for entry in results:
+            if isinstance(entry, dict) and isinstance(entry.get("hits"), list) and entry["hits"]:
+                return True
+    for key in ["Products", "products", "items", "Items"]:
+        items = payload.get(key)
+        if isinstance(items, list) and items:
+            return True
+    return False
+
+
+def capture_products_via_json(page, timeout_ms: int = 45000) -> List[Any]:
+    payloads: List[Any] = []
+    last_payload_count = 0
+    last_change = time.time()
+
+    def handle_response(response) -> None:
+        nonlocal last_payload_count, last_change
+        content_type = response.headers.get("content-type", "").lower()
+        if "application/json" not in content_type:
+            return
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        if not is_product_payload(payload):
+            return
+        payloads.append(payload)
+        last_payload_count = len(payloads)
+        last_change = time.time()
+
+    page.on("response", handle_response)
+
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        page.wait_for_timeout(500)
+        if payloads and time.time() - last_change > 2:
+            break
+
+    page.remove_listener("response", handle_response)
+    return payloads
+
+
+def flatten_products(payloads: List[Any]) -> List[Dict[str, Any]]:
+    flattened: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def item_key(item: Dict[str, Any]) -> str:
+        for key in ["objectID", "ProductId", "productId", "id", "sku", "SKU"]:
+            value = item.get(key)
+            if value:
+                return f"{key}:{value}"
+        dumped = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        digest = hashlib.sha1(dumped[:2000].encode("utf-8")).hexdigest()
+        return f"hash:{digest}"
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        items: List[Any] = []
+        hits = payload.get("hits")
+        if isinstance(hits, list) and hits:
+            items.extend(hits)
+        results = payload.get("results")
+        if isinstance(results, list):
+            for result in results:
+                if isinstance(result, dict) and isinstance(result.get("hits"), list):
+                    items.extend(result["hits"])
+        for key in ["Products", "products", "items", "Items"]:
+            collection = payload.get(key)
+            if isinstance(collection, list) and collection:
+                items.extend(collection)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = item_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            flattened.append(item)
+    return flattened
+
+
 def wait_for_grid(page, debug_dom: bool, debug_dir: Path) -> str:
     page.wait_for_load_state("domcontentloaded", timeout=60000)
     page.wait_for_timeout(1000)
@@ -715,25 +817,36 @@ def parse_args() -> argparse.Namespace:
 
 
 def parse_product_from_payload(payload: Dict[str, Any], page_url: str) -> Optional[Product]:
-    title = payload.get("title") or payload.get("name")
-    if title:
-        title = clean_text(str(title))
+    title = (
+        payload.get("title")
+        or payload.get("name")
+        or payload.get("productName")
+        or payload.get("product_name")
+    )
+    if isinstance(title, dict):
+        title = title.get("value") or title.get("text")
+    title = clean_text(str(title)) if title else None
 
     url = payload.get("url") or payload.get("productUrl") or payload.get("link")
     if isinstance(url, dict):
-        url = url.get("href")
+        url = url.get("href") or url.get("url")
     if url:
         url = urljoin(page_url, str(url))
 
-    image = payload.get("image") or payload.get("imageUrl") or payload.get("image_url")
+    image = (
+        payload.get("image")
+        or payload.get("imageUrl")
+        or payload.get("image_url")
+        or payload.get("primaryImage")
+    )
     if isinstance(image, dict):
         image = image.get("url") or image.get("src")
     if image:
         image = urljoin(page_url, str(image))
 
-    sku = payload.get("sku") or payload.get("productId") or payload.get("id")
+    sku = payload.get("sku") or payload.get("productId") or payload.get("id") or payload.get("objectID")
     if isinstance(sku, dict):
-        sku = sku.get("value")
+        sku = sku.get("value") or sku.get("id")
     if sku:
         sku = clean_text(str(sku))
     if not sku and url:
@@ -757,11 +870,18 @@ def parse_product_from_payload(payload: Dict[str, Any], page_url: str) -> Option
     elif direct_price is not None:
         price_values.extend(parse_price_values(str(direct_price)))
 
-    for key in ["salePrice", "sale_price", "currentPrice", "current_price", "sale"]:
+    for key in ["salePrice", "sale_price", "currentPrice", "current_price", "sale", "priceValue"]:
         if key in payload:
             price_values.extend(parse_price_values(str(payload.get(key))))
 
-    for key in ["originalPrice", "regularPrice", "regular_price", "listPrice", "original"]:
+    for key in [
+        "originalPrice",
+        "regularPrice",
+        "regular_price",
+        "listPrice",
+        "original",
+        "regular",
+    ]:
         if key in payload:
             price_values.extend(parse_price_values(str(payload.get(key))))
 
@@ -773,7 +893,7 @@ def parse_product_from_payload(payload: Dict[str, Any], page_url: str) -> Option
     regular_price, price = derive_prices(price_values)
     discount_pct = compute_discount(regular_price, price)
 
-    if not title or price is None:
+    if not title and not sku and not url:
         return None
 
     return Product(
@@ -869,7 +989,6 @@ def main() -> None:
     print(f"Debug DOM: {args.debug_dom}")
 
     captured_products: List[Product] = []
-    captured_urls: List[str] = []
     json_response_count = 0
 
     with sync_playwright() as playwright:
@@ -880,6 +999,7 @@ def main() -> None:
         )
         context = browser.new_context(
             locale="fr-CA",
+            timezone_id="America/Montreal",
             user_agent=STEALTH_USER_AGENT,
             extra_http_headers=STEALTH_HEADERS,
         )
@@ -889,57 +1009,32 @@ def main() -> None:
         page = context.new_page()
         last_response_headers: Optional[Dict[str, str]] = None
         try:
-            def handle_response(response) -> None:
-                nonlocal json_response_count
-                nonlocal last_response_headers
-                last_response_headers = response.headers
-                content_type = response.headers.get("content-type", "").lower()
-                url = response.url
-                if "application/json" not in content_type:
-                    return
-                if not any(token in url.lower() for token in ["search", "products", "plp", "listing", "graphql"]):
-                    return
-                json_response_count += 1
-                if url not in captured_urls:
-                    captured_urls.append(url)
-                try:
-                    payload = response.json()
-                except Exception:
-                    return
-                extracted = extract_products_from_json(payload, page.url)
-                if extracted:
-                    captured_products.extend(extracted)
-
-            page.on("response", handle_response)
-
             page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1500)
             accept_cookies(page)
-            tile_sel = wait_for_grid(page, args.debug_dom, debug_dir)
+            wait_for_hydration(page)
 
             if args.save_debug:
                 save_debug_artifacts(page, str(debug_dir), public_dir, "debug")
 
-            metrics = load_all_products(page, args.max_pages, tile_sel)
+            payloads = capture_products_via_json(page)
+            json_response_count = len(payloads)
+            if not payloads:
+                raise RuntimeError("Aucun payload JSON produits capturé (XHR)...")
 
-            if args.save_debug:
-                save_debug_artifacts(page, str(debug_dir), public_dir, "debug_after_load")
+            raw_items = flatten_products(payloads)
+            if not raw_items:
+                raise RuntimeError("Payload JSON capturé, mais aucun produit exploitable trouvé.")
 
-            html_content = page.content()
-            page_title = get_page_title(page)
-            if is_antibot_page(html_content, page_title):
-                print("ANTI-BOT SUSPECTÉ - artefacts conservés pour diagnostic.")
-                log_blocking_details(page)
+            for item in raw_items:
+                product = parse_product_from_payload(item, page.url)
+                if product:
+                    captured_products.append(product)
 
-            dom_products: List[Product] = []
-            for selector in CARD_SELECTORS:
-                for card in page.query_selector_all(selector):
-                    product = extract_product_from_card(card, page.url)
-                    if product.url or product.sku:
-                        dom_products.append(product)
+            if not captured_products:
+                raise RuntimeError("Payload JSON capturé, mais aucun produit exploitable trouvé.")
 
-            combined_products = merge_products(dom_products + captured_products)
-            combined_products = [item for item in combined_products if item.price is not None]
+            combined_products = merge_products(captured_products)
 
             combined_products.sort(
                 key=lambda item: (
@@ -957,16 +1052,9 @@ def main() -> None:
             duration = end_time - start_time
             print(f"Extracted {len(combined_products)} products")
             print(f"Total produits: {len(combined_products)}")
-            print(f"Total DOM: {len(dom_products)}")
             print(f"Total JSON capturés: {len(captured_products)}")
-            print(f"Réponses JSON capturées: {json_response_count}")
-            print(f"Load more clicks: {metrics.load_more_clicks}")
-            print(f"Raison arrêt: {metrics.stop_reason}")
+            print(f"Payloads JSON capturés: {json_response_count}")
             print(f"Durée totale: {duration:.2f}s")
-            if captured_urls:
-                print("Top 5 URLs XHR détectées:")
-                for url in captured_urls[:5]:
-                    print(f"- {url}")
         except Exception as exc:
             print(f"Erreur globale: {exc}")
             write_failure_artifacts(page, str(debug_dir), last_response_headers)
