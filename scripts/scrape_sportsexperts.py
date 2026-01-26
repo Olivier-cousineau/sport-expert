@@ -346,6 +346,60 @@ def save_debug_artifacts(page, debug_dir: str, public_dir: str, prefix: str) -> 
         print(f"Erreur HTML {prefix}: {exc}")
 
 
+def get_page_title(page) -> str:
+    try:
+        return page.title()
+    except Exception as exc:
+        print(f"Erreur récupération title: {exc}")
+        return ""
+
+
+def get_body_text_excerpt(page, limit: int = 500) -> str:
+    try:
+        body_text = page.locator("body").inner_text(timeout=5000)
+    except Exception as exc:
+        print(f"Erreur récupération body text: {exc}")
+        return ""
+    cleaned = " ".join(body_text.split())
+    return cleaned[:limit]
+
+
+def log_blocking_details(page) -> None:
+    title = get_page_title(page)
+    excerpt = get_body_text_excerpt(page)
+    if title:
+        print(f"[blocage] page.title(): {title}")
+    if excerpt:
+        print(f"[blocage] extrait texte: {excerpt}")
+
+
+def write_failure_artifacts(
+    page,
+    debug_dir: str,
+    response_headers: Optional[Dict[str, str]],
+) -> None:
+    ensure_output_dir(debug_dir)
+    fail_png = os.path.join(debug_dir, "fail.png")
+    fail_html = os.path.join(debug_dir, "fail.html")
+    try:
+        page.screenshot(path=fail_png, full_page=True)
+    except Exception as screenshot_exc:
+        print(f"Erreur screenshot fail: {screenshot_exc}")
+    try:
+        with open(fail_html, "w", encoding="utf-8") as handle:
+            handle.write(page.content())
+    except Exception as html_exc:
+        print(f"Erreur HTML fail: {html_exc}")
+    if response_headers:
+        headers_path = os.path.join(debug_dir, "response_headers.txt")
+        try:
+            with open(headers_path, "w", encoding="utf-8") as handle:
+                for key, value in response_headers.items():
+                    handle.write(f"{key}: {value}\n")
+        except Exception as headers_exc:
+            print(f"Erreur headers fail: {headers_exc}")
+
+
 def is_antibot_page(html: str, title: str) -> bool:
     html_lower = html.lower()
     title_lower = title.lower()
@@ -373,6 +427,7 @@ def wait_for_grid(page) -> str:
             last_error = exc
     html = page.content()
     if "Access Denied" in html or "cloudflare" in html.lower() or "captcha" in html.lower():
+        log_blocking_details(page)
         raise RuntimeError("Page semble bloquée (Access Denied / Cloudflare / Captcha).")
     raise last_error if last_error else RuntimeError("Grid introuvable (aucun sélecteur ne matche).")
 
@@ -439,6 +494,9 @@ def load_all_products(page, max_pages: int, tile_selector: str) -> LoadMetrics:
 
 
 def parse_args() -> argparse.Namespace:
+    default_headless = parse_bool(os.getenv("HEADLESS", "true"))
+    default_save_debug = parse_bool(os.getenv("SAVE_DEBUG", "true"))
+    default_max_pages = int(os.getenv("MAX_PAGES", "0") or 0)
     parser = argparse.ArgumentParser(
         description="Scrape Sports Experts clearance products.",
     )
@@ -450,22 +508,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=0,
+        default=default_max_pages,
         help="Maximum number of load cycles (0 = no limit).",
     )
     parser.add_argument(
         "--headless",
         type=parse_bool,
-        default=True,
+        default=default_headless,
         help="Run browser in headless mode (true/false).",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Shortcut to run with a visible browser window.",
+    )
+    parser.add_argument(
+        "--slow-mo",
+        type=int,
+        default=int(os.getenv("SLOW_MO", "0") or 0),
+        help="Slow motion delay in ms for each Playwright action.",
     )
     parser.add_argument(
         "--save-debug",
         type=parse_bool,
-        default=True,
+        default=default_save_debug,
         help="Save debug HTML/PNG artifacts (true/false).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.headed:
+        args.headless = False
+    return args
 
 
 def parse_product_from_payload(payload: Dict[str, Any], page_url: str) -> Optional[Product]:
@@ -615,6 +687,7 @@ def main() -> None:
     print(f"Scrape URL: {args.url}")
     print(f"Max pages: {args.max_pages}")
     print(f"Headless: {args.headless}")
+    print(f"Slow mo: {args.slow_mo}ms")
     print(f"Save debug: {args.save_debug}")
 
     captured_products: List[Product] = []
@@ -622,7 +695,11 @@ def main() -> None:
     json_response_count = 0
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=args.headless, args=STEALTH_ARGS)
+        browser = playwright.chromium.launch(
+            headless=args.headless,
+            args=STEALTH_ARGS,
+            slow_mo=args.slow_mo if args.slow_mo > 0 else None,
+        )
         context = browser.new_context(
             locale="fr-CA",
             user_agent=STEALTH_USER_AGENT,
@@ -632,9 +709,12 @@ def main() -> None:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = context.new_page()
+        last_response_headers: Optional[Dict[str, str]] = None
         try:
             def handle_response(response) -> None:
                 nonlocal json_response_count
+                nonlocal last_response_headers
+                last_response_headers = response.headers
                 content_type = response.headers.get("content-type", "").lower()
                 url = response.url
                 if "application/json" not in content_type:
@@ -668,9 +748,10 @@ def main() -> None:
                 save_debug_artifacts(page, debug_dir, public_dir, "debug_after_load")
 
             html_content = page.content()
-            page_title = page.title()
+            page_title = get_page_title(page)
             if is_antibot_page(html_content, page_title):
                 print("ANTI-BOT SUSPECTÉ - artefacts conservés pour diagnostic.")
+                log_blocking_details(page)
 
             dom_products: List[Product] = []
             for selector in CARD_SELECTORS:
@@ -707,17 +788,7 @@ def main() -> None:
                     print(f"- {url}")
         except Exception as exc:
             print(f"Erreur globale: {exc}")
-            if args.save_debug:
-                ensure_output_dir(debug_dir)
-                try:
-                    page.screenshot(path=os.path.join(debug_dir, "fail.png"), full_page=True)
-                except Exception as screenshot_exc:
-                    print(f"Erreur screenshot fail: {screenshot_exc}")
-                try:
-                    with open(os.path.join(debug_dir, "fail.html"), "w", encoding="utf-8") as handle:
-                        handle.write(page.content())
-                except Exception as html_exc:
-                    print(f"Erreur HTML fail: {html_exc}")
+            write_failure_artifacts(page, debug_dir, last_response_headers)
             raise
         finally:
             context.close()
