@@ -509,91 +509,105 @@ def main() -> None:
             if extracted:
                 captured_products.extend(extracted)
 
-        page.on("response", handle_response)
-
-        page.goto(args.url, wait_until="networkidle", timeout=60000)
-        page.wait_for_load_state("networkidle", timeout=30000)
-        page.wait_for_timeout(2000)
-        accept_cookies(page)
-        save_debug_artifacts(page, debug_dir, "se_after_goto")
-
         try:
-            page.wait_for_selector(",".join(PLP_SELECTORS), timeout=60000)
-            dom_ready = True
-        except PlaywrightTimeoutError:
-            dom_ready = False
-            print("MODE 1 échoué (DOM non détecté) -> fallback MODE 2")
+            page.on("response", handle_response)
 
-        load_all_products(
-            page,
-            max_cycles=args.max_cycles,
-            stable_cycles=args.stable_cycles,
-            min_cycles=args.min_cycles,
-        )
-        save_debug_artifacts(page, debug_dir, "se_after_load")
+            page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+            accept_cookies(page)
+            save_debug_artifacts(page, debug_dir, "se_after_goto")
 
-        html_content = page.content()
-        page_title = page.title()
-        if is_antibot_page(html_content, page_title):
-            print("ANTI-BOT SUSPECTÉ - artefacts conservés pour diagnostic.")
+            try:
+                page.wait_for_selector(",".join(PLP_SELECTORS), timeout=60000)
+                dom_ready = True
+            except PlaywrightTimeoutError:
+                dom_ready = False
+                print("MODE 1 échoué (DOM non détecté) -> fallback MODE 2")
 
-        items_by_url = {}
-        if dom_ready:
-            cards = find_card_elements(page)
-            print(f"Total candidates détectés (DOM): {len(cards)}")
-            for card in cards:
-                product = extract_product_from_card(card, page.url)
-                if product.url is None:
-                    continue
-                if product.url in items_by_url:
-                    continue
-                items_by_url[product.url] = product
-        else:
-            print("Extraction DOM ignorée (MODE 2 requis).")
-
-        if not items_by_url and captured_products:
-            for product in captured_products:
-                if product.url:
-                    key = product.url
-                else:
-                    key = f"{product.title}-{product.price_sale}"
-                if key in items_by_url:
-                    continue
-                items_by_url[key] = product
-
-        products = list(items_by_url.values())
-        filtered = [
-            item
-            for item in products
-            if item.discount_percent is not None and item.discount_percent >= 50
-        ]
-
-        filtered.sort(
-            key=lambda item: (
-                -(item.discount_percent or 0),
-                item.price_sale if item.price_sale is not None else float("inf"),
+            load_all_products(
+                page,
+                max_cycles=args.max_cycles,
+                stable_cycles=args.stable_cycles,
+                min_cycles=args.min_cycles,
             )
-        )
+            save_debug_artifacts(page, debug_dir, "se_after_load")
 
-        print(f"Total candidates détectés: {len(products)}")
-        print(f"Total filtrés 50%+: {len(filtered)}")
+            html_content = page.content()
+            page_title = page.title()
+            if is_antibot_page(html_content, page_title):
+                print("ANTI-BOT SUSPECTÉ - artefacts conservés pour diagnostic.")
 
-        csv_path = os.path.join(output_dir, "sportsexperts_liquidation_50plus.csv")
-        json_path = os.path.join(output_dir, "sportsexperts_liquidation_50plus.json")
-        write_csv(csv_path, filtered)
-        write_json(json_path, filtered)
+            items_by_url = {}
+            if dom_ready:
+                cards = find_card_elements(page)
+                print(f"Total candidates détectés (DOM): {len(cards)}")
+                for card in cards:
+                    product = extract_product_from_card(card, page.url)
+                    if product.url is None:
+                        continue
+                    if product.url in items_by_url:
+                        continue
+                    items_by_url[product.url] = product
+            else:
+                print("Extraction DOM ignorée (MODE 2 requis).")
 
-        print(f"CSV: {csv_path}")
-        print(f"JSON: {json_path}")
-        end_time = time.time()
-        print(f"Durée totale: {end_time - start_time:.2f}s")
-        print(f"Réponses JSON capturées: {json_response_count}")
-        print("Top 5 URLs XHR détectées:")
-        for url in captured_urls[:5]:
-            print(f"- {url}")
+            if not items_by_url and captured_products:
+                for product in captured_products:
+                    if product.url:
+                        key = product.url
+                    else:
+                        key = f"{product.title}-{product.price_sale}"
+                    if key in items_by_url:
+                        continue
+                    items_by_url[key] = product
 
-        context.close()
-        browser.close()
+            products = list(items_by_url.values())
+            filtered = [
+                item
+                for item in products
+                if item.discount_percent is not None and item.discount_percent >= 50
+            ]
+
+            filtered.sort(
+                key=lambda item: (
+                    -(item.discount_percent or 0),
+                    item.price_sale if item.price_sale is not None else float("inf"),
+                )
+            )
+
+            print(f"Total candidates détectés: {len(products)}")
+            print(f"Total filtrés 50%+: {len(filtered)}")
+
+            csv_path = os.path.join(output_dir, "sportsexperts_liquidation_50plus.csv")
+            json_path = os.path.join(output_dir, "sportsexperts_liquidation_50plus.json")
+            write_csv(csv_path, filtered)
+            write_json(json_path, filtered)
+
+            print(f"CSV: {csv_path}")
+            print(f"JSON: {json_path}")
+            end_time = time.time()
+            print(f"Durée totale: {end_time - start_time:.2f}s")
+            print(f"Réponses JSON capturées: {json_response_count}")
+            print("Top 5 URLs XHR détectées:")
+            for url in captured_urls[:5]:
+                print(f"- {url}")
+        except Exception as exc:
+            print(f"Erreur globale: {exc}")
+            if debug_mode:
+                ensure_output_dir(debug_dir)
+                try:
+                    page.screenshot(path=os.path.join(debug_dir, "fail.png"), full_page=True)
+                except Exception as screenshot_exc:
+                    print(f"Erreur screenshot fail: {screenshot_exc}")
+                try:
+                    with open(os.path.join(debug_dir, "fail.html"), "w", encoding="utf-8") as handle:
+                        handle.write(page.content())
+                except Exception as html_exc:
+                    print(f"Erreur HTML fail: {html_exc}")
+            raise
+        finally:
+            context.close()
+            browser.close()
 
 
 if __name__ == "__main__":
