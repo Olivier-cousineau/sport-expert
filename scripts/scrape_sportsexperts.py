@@ -27,12 +27,14 @@ GRID_SELECTORS = [
 ]
 
 CARD_SELECTORS = [
-    "[data-product-id]",
     "[data-testid='product-card']",
     ".product-card",
     ".product-card__wrapper",
     ".product-tile",
     "li.product",
+    'article:has(a[href*="/p/"])',
+    'li:has(a[href*="/p/"])',
+    'a[href*="/p/"]',
 ]
 
 TITLE_SELECTORS = [
@@ -111,6 +113,16 @@ ANTI_BOT_TITLE_KEYWORDS = [
     "denied",
     "attention",
     "security",
+]
+
+CLOUDFLARE_SELECTORS = [
+    "#cf-wrapper",
+    "div#cf-error-details",
+    "form#challenge-form",
+    "div.cf-browser-verification",
+    "div#challenge-form",
+    "iframe[src*='challenge']",
+    "iframe[src*='captcha']",
 ]
 
 STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
@@ -410,9 +422,84 @@ def is_antibot_page(html: str, title: str) -> bool:
     return False
 
 
-def wait_for_grid(page) -> str:
+def get_dom_excerpt(page, source: str, limit: int = 1500) -> str:
+    selector = "main"
+    locator = page.locator(selector)
+    if locator.count() == 0:
+        selector = "body"
+        locator = page.locator(selector)
+    try:
+        if source == "text":
+            content = locator.first.inner_text(timeout=5000)
+            content = " ".join(content.split())
+        else:
+            content = locator.first.inner_html(timeout=5000)
+    except Exception:
+        return ""
+    content = content.strip()
+    return content[:limit]
+
+
+def log_dom_debug(page) -> None:
+    print("[debug] DOM selector counts (grid):")
+    for selector in GRID_SELECTORS:
+        try:
+            count = page.locator(selector).count()
+        except Exception:
+            count = 0
+        print(f"[debug] {selector}: {count}")
+    print("[debug] DOM selector counts (cards):")
+    for selector in CARD_SELECTORS:
+        try:
+            count = page.locator(selector).count()
+        except Exception:
+            count = 0
+        print(f"[debug] {selector}: {count}")
+
+
+def log_no_grid_details(page) -> None:
+    try:
+        anchor_count = page.locator('a[href*="/p/"]').count()
+    except Exception:
+        anchor_count = 0
+    print(f'[grid] Fallback count a[href*="/p/"]: {anchor_count}')
+    print(f"[grid] page.url(): {page.url}")
+    title = get_page_title(page)
+    if title:
+        print(f"[grid] page.title(): {title}")
+    text_excerpt = get_dom_excerpt(page, "text")
+    html_excerpt = get_dom_excerpt(page, "html")
+    if text_excerpt:
+        print(f"[grid] main.inner_text excerpt: {text_excerpt}")
+    if html_excerpt:
+        print(f"[grid] main.inner_html excerpt: {html_excerpt}")
+
+
+def is_blocked_page(page) -> bool:
+    title = get_page_title(page)
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+    if is_antibot_page(html, title):
+        return True
+    html_lower = html.lower()
+    if "cloudflare" in html_lower or "cf-browser-verification" in html_lower:
+        return True
+    for selector in CLOUDFLARE_SELECTORS:
+        try:
+            if page.locator(selector).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def wait_for_grid(page, debug_dom: bool, debug_dir: str) -> str:
     last_error: Optional[Exception] = None
     page.wait_for_selector("body", timeout=20000)
+    if debug_dom:
+        log_dom_debug(page)
     for _ in range(2):
         page.mouse.wheel(0, 1200)
         page.wait_for_timeout(1000)
@@ -421,14 +508,16 @@ def wait_for_grid(page) -> str:
             page.wait_for_selector(selector, timeout=25000)
             count = page.locator(selector).count()
             if count > 0:
-                print(f"[grid] Found grid using selector: {selector} (count={count})")
+                print(f"[grid] Found tile selector: {selector} (count={count})")
                 return selector
         except Exception as exc:
             last_error = exc
-    html = page.content()
-    if "Access Denied" in html or "cloudflare" in html.lower() or "captcha" in html.lower():
+    if is_blocked_page(page):
         log_blocking_details(page)
-        raise RuntimeError("Page semble bloquée (Access Denied / Cloudflare / Captcha).")
+        write_failure_artifacts(page, debug_dir, None)
+        raise RuntimeError("Page semble bloquée (Cloudflare / Captcha / Access Denied).")
+    log_no_grid_details(page)
+    write_failure_artifacts(page, debug_dir, None)
     raise last_error if last_error else RuntimeError("Grid introuvable (aucun sélecteur ne matche).")
 
 
@@ -457,7 +546,7 @@ def load_all_products(page, max_pages: int, tile_selector: str) -> LoadMetrics:
     stable_cycles = 3
     stability = 0
     last_count = count_tiles(page, tile_selector)
-    max_iterations = max_pages if max_pages > 0 else 120
+    max_iterations = max_pages if max_pages > 0 else 200
 
     for iteration in range(max_iterations):
         metrics.iterations += 1
@@ -496,6 +585,7 @@ def load_all_products(page, max_pages: int, tile_selector: str) -> LoadMetrics:
 def parse_args() -> argparse.Namespace:
     default_headless = parse_bool(os.getenv("HEADLESS", "true"))
     default_save_debug = parse_bool(os.getenv("SAVE_DEBUG", "true"))
+    default_debug_dom = parse_bool(os.getenv("DEBUG_DOM", "false"))
     default_max_pages = int(os.getenv("MAX_PAGES", "0") or 0)
     parser = argparse.ArgumentParser(
         description="Scrape Sports Experts clearance products.",
@@ -533,6 +623,12 @@ def parse_args() -> argparse.Namespace:
         type=parse_bool,
         default=default_save_debug,
         help="Save debug HTML/PNG artifacts (true/false).",
+    )
+    parser.add_argument(
+        "--debug-dom",
+        type=parse_bool,
+        default=default_debug_dom,
+        help="Enable DOM debug logging (true/false).",
     )
     args = parser.parse_args()
     if args.headed:
@@ -685,10 +781,14 @@ def main() -> None:
         ensure_output_dir(debug_dir)
 
     print(f"Scrape URL: {args.url}")
-    print(f"Max pages: {args.max_pages}")
+    if args.max_pages == 0:
+        print("Max pages: 0 (no limit)")
+    else:
+        print(f"Max pages: {args.max_pages}")
     print(f"Headless: {args.headless}")
     print(f"Slow mo: {args.slow_mo}ms")
     print(f"Save debug: {args.save_debug}")
+    print(f"Debug DOM: {args.debug_dom}")
 
     captured_products: List[Product] = []
     captured_urls: List[str] = []
@@ -737,7 +837,7 @@ def main() -> None:
             page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1500)
             accept_cookies(page)
-            tile_sel = wait_for_grid(page)
+            tile_sel = wait_for_grid(page, args.debug_dom, debug_dir)
 
             if args.save_debug:
                 save_debug_artifacts(page, debug_dir, public_dir, "debug")
@@ -770,11 +870,14 @@ def main() -> None:
                 )
             )
 
-            output_path = os.path.join(public_dir, "products-index.json")
-            write_products(output_path, combined_products)
+            output_index = os.path.join(public_dir, "products-index.json")
+            output_all = os.path.join(public_dir, "products.json")
+            write_products(output_index, combined_products)
+            write_products(output_all, combined_products)
 
             end_time = time.time()
             duration = end_time - start_time
+            print(f"Extracted {len(combined_products)} products")
             print(f"Total produits: {len(combined_products)}")
             print(f"Total DOM: {len(dom_products)}")
             print(f"Total JSON capturés: {len(captured_products)}")
