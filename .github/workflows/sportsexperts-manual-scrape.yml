@@ -7,10 +7,15 @@ on:
         description: "Run headless?"
         required: true
         default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
       max_pages:
         description: "Max pages (0 = no limit)"
         required: true
         default: "0"
+        type: string
 
 permissions:
   contents: write
@@ -42,10 +47,10 @@ jobs:
           python scripts/scrape_sportsexperts.py
 
       - name: Upload debug artifacts
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: sportsexperts-debug
           path: |
             outputs/debug/**
-          if-no-files-found: ignore
+          if-no-files-found: warn
