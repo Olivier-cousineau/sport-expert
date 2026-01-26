@@ -16,12 +16,14 @@ BASE_URL = "https://www.sportsexperts.ca"
 TARGET_URL = "https://www.sportsexperts.ca/fr-CA/rabais/liquidation"
 
 GRID_SELECTORS = [
-    "[data-testid='product-grid']",
-    "[data-testid='product-card']",
-    ".product-grid",
-    ".product-list",
-    "ul.products",
-    "[data-product-id]",
+    '[data-testid*="product"]',
+    '[data-test*="product"]',
+    '[data-qa*="product"]',
+    ".product-tile",
+    ".productTile",
+    'article:has(a[href*="/p/"])',
+    'a[href*="/p/"]',
+    'li:has(a[href*="/p/"])',
 ]
 
 CARD_SELECTORS = [
@@ -354,40 +356,29 @@ def is_antibot_page(html: str, title: str) -> bool:
     return False
 
 
-def wait_for_grid(page) -> None:
+def wait_for_grid(page) -> str:
     last_error: Optional[Exception] = None
+    page.wait_for_selector("body", timeout=20000)
+    for _ in range(2):
+        page.mouse.wheel(0, 1200)
+        page.wait_for_timeout(1000)
     for selector in GRID_SELECTORS:
         try:
-            page.wait_for_selector(selector, timeout=20000)
-            return
-        except PlaywrightTimeoutError as exc:
+            page.wait_for_selector(selector, timeout=25000)
+            count = page.locator(selector).count()
+            if count > 0:
+                print(f"[grid] Found grid using selector: {selector} (count={count})")
+                return selector
+        except Exception as exc:
             last_error = exc
-    if last_error:
-        raise last_error
+    html = page.content()
+    if "Access Denied" in html or "cloudflare" in html.lower() or "captcha" in html.lower():
+        raise RuntimeError("Page semble bloquée (Access Denied / Cloudflare / Captcha).")
+    raise last_error if last_error else RuntimeError("Grid introuvable (aucun sélecteur ne matche).")
 
 
-def count_cards(page) -> int:
-    unique: set = set()
-    for selector in CARD_SELECTORS:
-        try:
-            keys = page.eval_on_selector_all(
-                selector,
-                """
-                els => els.map(el => {
-                  return (
-                    el.getAttribute('data-product-id') ||
-                    el.getAttribute('data-sku') ||
-                    el.getAttribute('data-itemid') ||
-                    el.querySelector('a')?.href ||
-                    el.outerHTML
-                  );
-                })
-                """,
-            )
-            unique.update(keys)
-        except PlaywrightTimeoutError:
-            continue
-    return len(unique)
+def count_tiles(page, selector: str) -> int:
+    return page.locator(selector).count()
 
 
 def click_load_more(page) -> bool:
@@ -406,11 +397,11 @@ def click_load_more(page) -> bool:
     return False
 
 
-def load_all_products(page, max_pages: int) -> LoadMetrics:
+def load_all_products(page, max_pages: int, tile_selector: str) -> LoadMetrics:
     metrics = LoadMetrics()
     stable_cycles = 3
     stability = 0
-    last_count = count_cards(page)
+    last_count = count_tiles(page, tile_selector)
     max_iterations = max_pages if max_pages > 0 else 120
 
     for iteration in range(max_iterations):
@@ -422,7 +413,7 @@ def load_all_products(page, max_pages: int) -> LoadMetrics:
             metrics.load_more_clicks += 1
             page.wait_for_timeout(1500)
         page.wait_for_timeout(500)
-        current_count = count_cards(page)
+        current_count = count_tiles(page, tile_selector)
         print(
             "Iteration {iteration}: produits={current} (prev={prev}) click={clicked}".format(
                 iteration=iteration + 1,
@@ -641,82 +632,96 @@ def main() -> None:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = context.new_page()
+        try:
+            def handle_response(response) -> None:
+                nonlocal json_response_count
+                content_type = response.headers.get("content-type", "").lower()
+                url = response.url
+                if "application/json" not in content_type:
+                    return
+                if not any(token in url.lower() for token in ["search", "products", "plp", "listing", "graphql"]):
+                    return
+                json_response_count += 1
+                if url not in captured_urls:
+                    captured_urls.append(url)
+                try:
+                    payload = response.json()
+                except Exception:
+                    return
+                extracted = extract_products_from_json(payload, page.url)
+                if extracted:
+                    captured_products.extend(extracted)
 
-        def handle_response(response) -> None:
-            nonlocal json_response_count
-            content_type = response.headers.get("content-type", "").lower()
-            url = response.url
-            if "application/json" not in content_type:
-                return
-            if not any(token in url.lower() for token in ["search", "products", "plp", "listing", "graphql"]):
-                return
-            json_response_count += 1
-            if url not in captured_urls:
-                captured_urls.append(url)
-            try:
-                payload = response.json()
-            except Exception:
-                return
-            extracted = extract_products_from_json(payload, page.url)
-            if extracted:
-                captured_products.extend(extracted)
+            page.on("response", handle_response)
 
-        page.on("response", handle_response)
+            page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+            accept_cookies(page)
+            tile_sel = wait_for_grid(page)
 
-        page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(1000)
-        accept_cookies(page)
-        wait_for_grid(page)
+            if args.save_debug:
+                save_debug_artifacts(page, debug_dir, public_dir, "debug")
 
-        if args.save_debug:
-            save_debug_artifacts(page, debug_dir, public_dir, "debug")
+            metrics = load_all_products(page, args.max_pages, tile_sel)
 
-        metrics = load_all_products(page, args.max_pages)
+            if args.save_debug:
+                save_debug_artifacts(page, debug_dir, public_dir, "debug_after_load")
 
-        if args.save_debug:
-            save_debug_artifacts(page, debug_dir, public_dir, "debug_after_load")
+            html_content = page.content()
+            page_title = page.title()
+            if is_antibot_page(html_content, page_title):
+                print("ANTI-BOT SUSPECTÉ - artefacts conservés pour diagnostic.")
 
-        html_content = page.content()
-        page_title = page.title()
-        if is_antibot_page(html_content, page_title):
-            print("ANTI-BOT SUSPECTÉ - artefacts conservés pour diagnostic.")
+            dom_products: List[Product] = []
+            for selector in CARD_SELECTORS:
+                for card in page.query_selector_all(selector):
+                    product = extract_product_from_card(card, page.url)
+                    if product.url or product.sku:
+                        dom_products.append(product)
 
-        dom_products: List[Product] = []
-        for selector in CARD_SELECTORS:
-            for card in page.query_selector_all(selector):
-                product = extract_product_from_card(card, page.url)
-                if product.url or product.sku:
-                    dom_products.append(product)
+            combined_products = merge_products(dom_products + captured_products)
+            combined_products = [item for item in combined_products if item.price is not None]
 
-        combined_products = merge_products(dom_products + captured_products)
-        combined_products = [item for item in combined_products if item.price is not None]
-
-        combined_products.sort(
-            key=lambda item: (
-                -(item.discount_pct or 0),
-                item.price if item.price is not None else float("inf"),
+            combined_products.sort(
+                key=lambda item: (
+                    -(item.discount_pct or 0),
+                    item.price if item.price is not None else float("inf"),
+                )
             )
-        )
 
-        output_path = os.path.join(public_dir, "products-index.json")
-        write_products(output_path, combined_products)
+            output_path = os.path.join(public_dir, "products-index.json")
+            write_products(output_path, combined_products)
 
-        end_time = time.time()
-        duration = end_time - start_time
-        print(f"Total produits: {len(combined_products)}")
-        print(f"Total DOM: {len(dom_products)}")
-        print(f"Total JSON capturés: {len(captured_products)}")
-        print(f"Réponses JSON capturées: {json_response_count}")
-        print(f"Load more clicks: {metrics.load_more_clicks}")
-        print(f"Raison arrêt: {metrics.stop_reason}")
-        print(f"Durée totale: {duration:.2f}s")
-        if captured_urls:
-            print("Top 5 URLs XHR détectées:")
-            for url in captured_urls[:5]:
-                print(f"- {url}")
-
-        context.close()
-        browser.close()
+            end_time = time.time()
+            duration = end_time - start_time
+            print(f"Total produits: {len(combined_products)}")
+            print(f"Total DOM: {len(dom_products)}")
+            print(f"Total JSON capturés: {len(captured_products)}")
+            print(f"Réponses JSON capturées: {json_response_count}")
+            print(f"Load more clicks: {metrics.load_more_clicks}")
+            print(f"Raison arrêt: {metrics.stop_reason}")
+            print(f"Durée totale: {duration:.2f}s")
+            if captured_urls:
+                print("Top 5 URLs XHR détectées:")
+                for url in captured_urls[:5]:
+                    print(f"- {url}")
+        except Exception as exc:
+            print(f"Erreur globale: {exc}")
+            if args.save_debug:
+                ensure_output_dir(debug_dir)
+                try:
+                    page.screenshot(path=os.path.join(debug_dir, "fail.png"), full_page=True)
+                except Exception as screenshot_exc:
+                    print(f"Erreur screenshot fail: {screenshot_exc}")
+                try:
+                    with open(os.path.join(debug_dir, "fail.html"), "w", encoding="utf-8") as handle:
+                        handle.write(page.content())
+                except Exception as html_exc:
+                    print(f"Erreur HTML fail: {html_exc}")
+            raise
+        finally:
+            context.close()
+            browser.close()
 
 
 if __name__ == "__main__":
