@@ -1,0 +1,53 @@
+name: SportExperts Manual Scrape
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "Maximum load cycles (0 = no limit)"
+        default: "0"
+        required: false
+        type: string
+      headless:
+        description: "Run headless"
+        default: "true"
+        required: false
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install chromium
+
+      - name: Run scraper
+        run: |
+          python scripts/scrape_sportsexperts.py \
+            --url "https://www.sportsexperts.ca/fr-CA/rabais/liquidation" \
+            --max-pages "${{ inputs.max_pages }}" \
+            --headless "${{ inputs.headless }}" \
+            --save-debug true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sportsexperts-scrape
+          path: |
+            public/sportsexperts/**
+            outputs/debug/**
+          if-no-files-found: warn
