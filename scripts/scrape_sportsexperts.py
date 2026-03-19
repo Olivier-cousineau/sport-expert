@@ -170,6 +170,22 @@ def parse_bool(value: str) -> bool:
     return normalized in {"1", "true", "yes", "y", "on"}
 
 
+def has_display_server() -> bool:
+    return bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
+
+
+def normalize_headless_mode(headless: bool, headed: bool) -> bool:
+    if headed:
+        headless = False
+    if not headless and not has_display_server():
+        print(
+            "[browser] Aucun serveur d'affichage détecté (DISPLAY/WAYLAND_DISPLAY). "
+            "Bascule automatique en mode headless."
+        )
+        return True
+    return headless
+
+
 def clean_text(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -837,8 +853,7 @@ def parse_args() -> argparse.Namespace:
         help="Enable DOM debug logging (true/false).",
     )
     args = parser.parse_args()
-    if args.headed:
-        args.headless = False
+    args.headless = normalize_headless_mode(args.headless, args.headed)
     return args
 
 
