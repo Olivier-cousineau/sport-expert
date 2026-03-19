@@ -710,6 +710,23 @@ def wait_for_grid(page, debug_dom: bool, debug_dir: Path) -> str:
     )
 
 
+def find_card_elements(page) -> List[Any]:
+    elements = []
+    seen = set()
+    for selector in CARD_SELECTORS:
+        for element in page.query_selector_all(selector):
+            try:
+                key = element.evaluate("el => el.outerHTML")
+            except Exception:
+                key = None
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            elements.append(element)
+    return elements
+
+
 def count_tiles(page, selector: str) -> int:
     return page.locator(selector).count()
 
@@ -998,6 +1015,7 @@ def main() -> None:
     print(f"Debug DOM: {args.debug_dom}")
 
     captured_products: List[Product] = []
+    payloads: List[Any] = []
     json_response_count = 0
 
     with sync_playwright() as playwright:
@@ -1017,6 +1035,23 @@ def main() -> None:
         )
         page = context.new_page()
         last_response_headers: Optional[Dict[str, str]] = None
+
+        def handle_response(response) -> None:
+            nonlocal last_response_headers
+            content_type = response.headers.get("content-type", "").lower()
+            if "application/json" not in content_type:
+                return
+            try:
+                payload = response.json()
+            except Exception:
+                return
+            if not is_product_payload(payload):
+                return
+            payloads.append(payload)
+            last_response_headers = dict(response.headers)
+
+        page.on("response", handle_response)
+
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1500)
@@ -1026,14 +1061,19 @@ def main() -> None:
             if args.save_debug:
                 save_debug_artifacts(page, str(debug_dir), public_dir, "debug")
 
-            payloads = capture_products_via_json(page)
-            json_response_count = len(payloads)
-            if not payloads:
-                raise RuntimeError("Aucun payload JSON produits capturé (XHR)...")
+            tile_selector = wait_for_grid(page, args.debug_dom, debug_dir)
+            load_metrics = load_all_products(page, args.max_pages, tile_selector)
+            print(
+                "Chargement DOM: iterations={iterations} clicks={clicks} stop={stop}".format(
+                    iterations=load_metrics.iterations,
+                    clicks=load_metrics.load_more_clicks,
+                    stop=load_metrics.stop_reason,
+                )
+            )
 
+            page.wait_for_timeout(2000)
+            json_response_count = len(payloads)
             raw_items = flatten_products(payloads)
-            if not raw_items:
-                raise RuntimeError("Payload JSON capturé, mais aucun produit exploitable trouvé.")
 
             for item in raw_items:
                 product = parse_product_from_payload(item, page.url)
@@ -1041,7 +1081,18 @@ def main() -> None:
                     captured_products.append(product)
 
             if not captured_products:
-                raise RuntimeError("Payload JSON capturé, mais aucun produit exploitable trouvé.")
+                cards = find_card_elements(page)
+                print(f"Fallback DOM activé: {len(cards)} cartes candidates")
+                for card in cards:
+                    product = extract_product_from_card(card, page.url)
+                    if not product.url and not product.title and not product.sku:
+                        continue
+                    captured_products.append(product)
+
+            if not captured_products:
+                raise RuntimeError(
+                    "Aucun produit exploitable trouvé après capture JSON et fallback DOM."
+                )
 
             combined_products = merge_products(captured_products)
 
