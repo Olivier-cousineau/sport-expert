@@ -23,8 +23,11 @@ GRID_SELECTORS = [
     '[data-qa*="product"]',
     ".product-tile",
     ".productTile",
+    'article:has(a[href*="/p-"])',
     'article:has(a[href*="/p/"])',
+    'a[href*="/p-"]',
     'a[href*="/p/"]',
+    'li:has(a[href*="/p-"])',
     'li:has(a[href*="/p/"])',
 ]
 
@@ -34,8 +37,11 @@ CARD_SELECTORS = [
     ".product-card__wrapper",
     ".product-tile",
     "li.product",
+    'article:has(a[href*="/p-"])',
     'article:has(a[href*="/p/"])',
+    'li:has(a[href*="/p-"])',
     'li:has(a[href*="/p/"])',
+    'a[href*="/p-"]',
     'a[href*="/p/"]',
 ]
 
@@ -66,6 +72,7 @@ IMAGE_SELECTORS = [
 
 PRODUCT_LINK_SELECTORS = [
     "a[href*='/p-']",
+    "a[href*='/p/']",
     "a[href*='/product']",
     "a[href]",
 ]
@@ -161,6 +168,22 @@ def parse_bool(value: str) -> bool:
         return False
     normalized = str(value).strip().lower()
     return normalized in {"1", "true", "yes", "y", "on"}
+
+
+def has_display_server() -> bool:
+    return bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
+
+
+def normalize_headless_mode(headless: bool, headed: bool) -> bool:
+    if headed:
+        headless = False
+    if not headless and not has_display_server():
+        print(
+            "[browser] Aucun serveur d'affichage détecté (DISPLAY/WAYLAND_DISPLAY). "
+            "Bascule automatique en mode headless."
+        )
+        return True
+    return headless
 
 
 def clean_text(value: Optional[str]) -> Optional[str]:
@@ -279,7 +302,7 @@ def extract_sku_from_card(element, url: Optional[str]) -> Optional[str]:
                 if cleaned:
                     return cleaned
     if url:
-        match = re.search(r"/p-([A-Za-z0-9_-]+)", url)
+        match = re.search(r"/p[-/]([A-Za-z0-9_-]+)", url)
         if match:
             return match.group(1)
     return None
@@ -470,10 +493,10 @@ def log_dom_debug(page) -> None:
 
 def log_no_grid_details(page) -> None:
     try:
-        anchor_count = page.locator('a[href*="/p/"]').count()
+        anchor_count = page.locator('a[href*="/p-"], a[href*="/p/"]').count()
     except Exception:
         anchor_count = 0
-    print(f'[grid] Fallback count a[href*="/p/"]: {anchor_count}')
+    print(f'[grid] Fallback count product anchors: {anchor_count}')
     print(f"[grid] page.url(): {page.url}")
     title = get_page_title(page)
     if title:
@@ -658,11 +681,13 @@ def wait_for_grid(page, debug_dom: bool, debug_dir: Path) -> str:
         raise RuntimeError("Page semble bloquée (Cloudflare / Captcha / Access Denied).")
 
     candidate_selectors = [
+        "a[href*='/p-']",
         "a[href*='/p/']",
         "[data-testid*='product']",
         "[data-test*='product']",
         ".product-tile, .productTile, .product-card, .productCard",
         "[itemtype*='Product']",
+        "li:has(a[href*='/p-'])",
         "li:has(a[href*='/p/'])",
     ]
 
@@ -699,6 +724,23 @@ def wait_for_grid(page, debug_dom: bool, debug_dir: Path) -> str:
         "Grille produits introuvable (pas un blocage). "
         f"selectors_testés={last_counts}"
     )
+
+
+def find_card_elements(page) -> List[Any]:
+    elements = []
+    seen = set()
+    for selector in CARD_SELECTORS:
+        for element in page.query_selector_all(selector):
+            try:
+                key = element.evaluate("el => el.outerHTML")
+            except Exception:
+                key = None
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            elements.append(element)
+    return elements
 
 
 def count_tiles(page, selector: str) -> int:
@@ -811,8 +853,7 @@ def parse_args() -> argparse.Namespace:
         help="Enable DOM debug logging (true/false).",
     )
     args = parser.parse_args()
-    if args.headed:
-        args.headless = False
+    args.headless = normalize_headless_mode(args.headless, args.headed)
     return args
 
 
@@ -850,7 +891,7 @@ def parse_product_from_payload(payload: Dict[str, Any], page_url: str) -> Option
     if sku:
         sku = clean_text(str(sku))
     if not sku and url:
-        match = re.search(r"/p-([A-Za-z0-9_-]+)", url)
+        match = re.search(r"/p[-/]([A-Za-z0-9_-]+)", url)
         if match:
             sku = match.group(1)
 
@@ -989,6 +1030,7 @@ def main() -> None:
     print(f"Debug DOM: {args.debug_dom}")
 
     captured_products: List[Product] = []
+    payloads: List[Any] = []
     json_response_count = 0
 
     with sync_playwright() as playwright:
@@ -1008,6 +1050,23 @@ def main() -> None:
         )
         page = context.new_page()
         last_response_headers: Optional[Dict[str, str]] = None
+
+        def handle_response(response) -> None:
+            nonlocal last_response_headers
+            content_type = response.headers.get("content-type", "").lower()
+            if "application/json" not in content_type:
+                return
+            try:
+                payload = response.json()
+            except Exception:
+                return
+            if not is_product_payload(payload):
+                return
+            payloads.append(payload)
+            last_response_headers = dict(response.headers)
+
+        page.on("response", handle_response)
+
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1500)
@@ -1017,14 +1076,19 @@ def main() -> None:
             if args.save_debug:
                 save_debug_artifacts(page, str(debug_dir), public_dir, "debug")
 
-            payloads = capture_products_via_json(page)
-            json_response_count = len(payloads)
-            if not payloads:
-                raise RuntimeError("Aucun payload JSON produits capturé (XHR)...")
+            tile_selector = wait_for_grid(page, args.debug_dom, debug_dir)
+            load_metrics = load_all_products(page, args.max_pages, tile_selector)
+            print(
+                "Chargement DOM: iterations={iterations} clicks={clicks} stop={stop}".format(
+                    iterations=load_metrics.iterations,
+                    clicks=load_metrics.load_more_clicks,
+                    stop=load_metrics.stop_reason,
+                )
+            )
 
+            page.wait_for_timeout(2000)
+            json_response_count = len(payloads)
             raw_items = flatten_products(payloads)
-            if not raw_items:
-                raise RuntimeError("Payload JSON capturé, mais aucun produit exploitable trouvé.")
 
             for item in raw_items:
                 product = parse_product_from_payload(item, page.url)
@@ -1032,7 +1096,18 @@ def main() -> None:
                     captured_products.append(product)
 
             if not captured_products:
-                raise RuntimeError("Payload JSON capturé, mais aucun produit exploitable trouvé.")
+                cards = find_card_elements(page)
+                print(f"Fallback DOM activé: {len(cards)} cartes candidates")
+                for card in cards:
+                    product = extract_product_from_card(card, page.url)
+                    if not product.url and not product.title and not product.sku:
+                        continue
+                    captured_products.append(product)
+
+            if not captured_products:
+                raise RuntimeError(
+                    "Aucun produit exploitable trouvé après capture JSON et fallback DOM."
+                )
 
             combined_products = merge_products(captured_products)
 

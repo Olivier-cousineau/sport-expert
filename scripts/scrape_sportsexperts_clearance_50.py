@@ -24,6 +24,12 @@ CARD_SELECTORS = [
     ".product-card__wrapper",
     ".product-tile",
     "li.product",
+    "article:has(a[href*='/p-'])",
+    "article:has(a[href*='/p/'])",
+    "li:has(a[href*='/p-'])",
+    "li:has(a[href*='/p/'])",
+    "a[href*='/p-']",
+    "a[href*='/p/']",
 ]
 
 TITLE_SELECTORS = [
@@ -49,6 +55,7 @@ IMAGE_SELECTORS = [
 
 PRODUCT_LINK_SELECTORS = [
     "a[href*='/p-']",
+    "a[href*='/p/']",
     "a[href*='/product']",
     "a",
 ]
