@@ -23,8 +23,11 @@ GRID_SELECTORS = [
     '[data-qa*="product"]',
     ".product-tile",
     ".productTile",
+    'article:has(a[href*="/p-"])',
     'article:has(a[href*="/p/"])',
+    'a[href*="/p-"]',
     'a[href*="/p/"]',
+    'li:has(a[href*="/p-"])',
     'li:has(a[href*="/p/"])',
 ]
 
@@ -34,8 +37,11 @@ CARD_SELECTORS = [
     ".product-card__wrapper",
     ".product-tile",
     "li.product",
+    'article:has(a[href*="/p-"])',
     'article:has(a[href*="/p/"])',
+    'li:has(a[href*="/p-"])',
     'li:has(a[href*="/p/"])',
+    'a[href*="/p-"]',
     'a[href*="/p/"]',
 ]
 
@@ -66,6 +72,7 @@ IMAGE_SELECTORS = [
 
 PRODUCT_LINK_SELECTORS = [
     "a[href*='/p-']",
+    "a[href*='/p/']",
     "a[href*='/product']",
     "a[href]",
 ]
@@ -279,7 +286,7 @@ def extract_sku_from_card(element, url: Optional[str]) -> Optional[str]:
                 if cleaned:
                     return cleaned
     if url:
-        match = re.search(r"/p-([A-Za-z0-9_-]+)", url)
+        match = re.search(r"/p[-/]([A-Za-z0-9_-]+)", url)
         if match:
             return match.group(1)
     return None
@@ -470,10 +477,10 @@ def log_dom_debug(page) -> None:
 
 def log_no_grid_details(page) -> None:
     try:
-        anchor_count = page.locator('a[href*="/p/"]').count()
+        anchor_count = page.locator('a[href*="/p-"], a[href*="/p/"]').count()
     except Exception:
         anchor_count = 0
-    print(f'[grid] Fallback count a[href*="/p/"]: {anchor_count}')
+    print(f'[grid] Fallback count product anchors: {anchor_count}')
     print(f"[grid] page.url(): {page.url}")
     title = get_page_title(page)
     if title:
@@ -658,11 +665,13 @@ def wait_for_grid(page, debug_dom: bool, debug_dir: Path) -> str:
         raise RuntimeError("Page semble bloquée (Cloudflare / Captcha / Access Denied).")
 
     candidate_selectors = [
+        "a[href*='/p-']",
         "a[href*='/p/']",
         "[data-testid*='product']",
         "[data-test*='product']",
         ".product-tile, .productTile, .product-card, .productCard",
         "[itemtype*='Product']",
+        "li:has(a[href*='/p-'])",
         "li:has(a[href*='/p/'])",
     ]
 
@@ -850,7 +859,7 @@ def parse_product_from_payload(payload: Dict[str, Any], page_url: str) -> Option
     if sku:
         sku = clean_text(str(sku))
     if not sku and url:
-        match = re.search(r"/p-([A-Za-z0-9_-]+)", url)
+        match = re.search(r"/p[-/]([A-Za-z0-9_-]+)", url)
         if match:
             sku = match.group(1)
 
